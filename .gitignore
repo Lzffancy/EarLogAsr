@@ -1,0 +1,13 @@
+# data & outputs
+*.wav
+*.npy
+*.json
+*.jsonl
+*.txt
+!requirements.txt
+
+# env & models
+.venv/
+models/
+__pycache__/
+*.pyc

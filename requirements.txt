@@ -1,0 +1,9 @@
+torch>=2.0
+torchaudio>=2.0
+funasr>=1.4
+soundfile
+numpy
+scikit-learn
+silero-vad
+panns_inference
+modelscope
