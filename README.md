@@ -35,13 +35,26 @@ python scene_timeline.py <wav> sc_xxx
 
 # 4. 融合：三流对齐到统一时间轴
 python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.json
+
+# 5. 复核（可选）：低置信段用 FireRedASR2-AED 重转写，拿回完整句+精确时间戳
+python firered_review.py <wav> sw_xxx sw_xxx_review
+python firered_review.py <wav> sw_xxx sw_xxx_review --ranges=24:00-30:00  # 手动指定段
 ```
+
+复核通道说明：
+
+- 低置信判定：叠字/重复率 >0.30、标点占比 >0.35、活跃段语速 <1 字/秒；相邻标记合并成 ≤90s 复核段
+- 复核预算默认封顶音频时长的 20%（`EARLOG_REVIEW_MAX_FRAC` 可调），按严重度排序取舍
+- 依赖仓库外的 FireRedASR2S（不入库）：`FIRERED_REPO` / `FIRERED_AED_DIR` / `FIRERED_VAD_DIR` 指路径
+- FireRedVAD 阈值默认降到 0.25（`FIRERED_VAD_THRESHOLD`），否则会滤掉正是要复核的低音量语音；`FIRERED_REVIEW_VAD=0` 可整体关 VAD（召回略高但没有段内时间戳）
+- AED 对极低音量段会返回 `<sil>` 被判空——这是真实能力下限，此时报告里以 SV 原文为准
 
 ## 模块
 
 - `sensevoice_transcribe.py`：SenseVoice 富标签解析（parse_rich / fmt_ts），也可独立转写
 - `earlog_pipeline.py`：聚类与段合并工具库（cluster / merge_segments）
 - `device_config.py`：设备自动探测（GPU/CPU 回落），被所有管线脚本 import，勿删
+- `firered_review.py`：复核第二通道（低置信段 → FireRedASR2-AED 重转写）
 
 ## 依赖
 
