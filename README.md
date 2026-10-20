@@ -1,8 +1,24 @@
 # EarLogAsr
 
-录音笔长音频的本地离线分析管线（中文场景，CPU 可跑）。
+录音笔长音频的本地离线分析管线（中文场景，CPU 可跑，有 GPU 自动加速）。
 
 架构：ASR 层三条流 → 统一时间轴 JSONL → LLM 层还原。
+
+## 设备兼容
+
+所有脚本通过 `device_config.py` 自动探测设备：`torch.cuda.is_available()` 为真就走 `cuda:0`，否则回落 CPU。无需改代码。
+
+```bash
+# 强制指定设备（可选）
+EARLOG_DEVICE=cpu python slidewin_pipeline.py ...     # 有 GPU 也强制用 CPU
+EARLOG_DEVICE=cuda:0 python slidewin_pipeline.py ...  # 显式指定卡
+```
+
+GPU 模式下注意：
+
+- `slidewin_pipeline.py` 的多进程参数 `jobs` 会被强制为 1（多进程抢一张卡只会 OOM）；GPU 本身够快，不需要多进程
+- GPU 机器装 CUDA 版 torch：`pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121`（torch 与 torchaudio 版本必须一致）
+- 3050 4G 笔记本实测可跑全部三条流（SenseVoice/CAM++/PANNs 都是小模型，显存占用 <1GB）
 
 ## 管线
 
@@ -25,6 +41,7 @@ python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.js
 
 - `sensevoice_transcribe.py`：SenseVoice 富标签解析（parse_rich / fmt_ts），也可独立转写
 - `earlog_pipeline.py`：聚类与段合并工具库（cluster / merge_segments）
+- `device_config.py`：设备自动探测（GPU/CPU 回落），被所有管线脚本 import，勿删
 
 ## 依赖
 
