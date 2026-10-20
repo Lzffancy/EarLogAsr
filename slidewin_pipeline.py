@@ -24,6 +24,7 @@ from funasr import AutoModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sensevoice_transcribe import parse_rich, fmt_ts
+from device_config import funasr_device, on_gpu, describe
 
 WIN_S = 30        # window length
 STRIDE_S = 20     # stride (10s overlap)
@@ -70,9 +71,61 @@ def align_merge(accum, new_text):
     return new_text, 0
 
 
+# ---------------- parallel workers ----------------
+# windows are independent: ASR runs in worker processes, merge stays serial
+
+_G = {}
+
+
+def _worker_init(npy_path, n_threads):
+    torch.set_num_threads(n_threads)
+    from funasr import AutoModel as AM
+    _G["wav"] = np.load(npy_path, mmap_mode="r")
+    _G["asr"] = AM(model="iic/SenseVoiceSmall", disable_update=True,
+                   device=funasr_device())
+
+
+def _worker_transcribe(task):
+    i, st = task
+    win = WIN_S * 16000
+    seg = np.asarray(_G["wav"][st: st + win])
+    res = _G["asr"].generate(input=seg, cache={}, language="zh", use_itn=True)
+    return i, res[0]["text"]
+
+
+def parallel_transcribe(wav16, starts, jobs):
+    """Returns dict {window_index: raw_text}. Each worker loads its own model
+    and reads audio via memmap."""
+    import tempfile
+    from multiprocessing import Pool
+    n_threads = max(1, (os.cpu_count() or 8) // jobs)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
+        tmp = f.name
+    try:
+        np.save(tmp, wav16)
+        with Pool(jobs, initializer=_worker_init,
+                  initargs=(tmp, n_threads)) as pool:
+            out = {}
+            done = 0
+            for i, text in pool.imap_unordered(
+                    _worker_transcribe, list(enumerate(starts)), chunksize=1):
+                out[i] = text
+                done += 1
+                if done % 10 == 0:
+                    print(f"  asr {done}/{len(starts)} (jobs={jobs})")
+        return out
+    finally:
+        os.unlink(tmp)
+
+
 def main():
     wav_path = sys.argv[1]
     out_prefix = sys.argv[2]
+    jobs = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    if on_gpu() and jobs > 1:
+        print("GPU mode: forcing jobs=1 (multi-process would contend for one GPU)")
+        jobs = 1
+    print(f"device: {describe()}")
 
     print("loading audio...")
     audio, sr = sf.read(wav_path, dtype="float32")
@@ -82,36 +135,56 @@ def main():
         torch.from_numpy(audio).unsqueeze(0), sr, 16000)[0].numpy()
     total_s = len(wav16) / 16000
 
-    print("loading model...")
-    asr = AutoModel(model="iic/SenseVoiceSmall", disable_update=True, device="cpu")
-
     win, stride = WIN_S * 16000, STRIDE_S * 16000
     starts = list(range(0, max(1, len(wav16) - win + 1), stride))
     if len(wav16) - starts[-1] > 8 * 16000:   # tail worth transcribing
         starts.append(len(wav16) - win)
-    print(f"audio {total_s:.0f}s, windows: {len(starts)}")
+    print(f"audio {total_s:.0f}s, windows: {len(starts)}, jobs={jobs}")
 
-    t0 = time.time()
-    records = []          # per-window kept pieces: {start_s, end_s, text}
-    accum = ""
-    n_blank = 0
+    # energy gate: skip windows that are true silence (not VAD — raw RMS only)
+    RMS_SKIP = 1e-3
+    active, n_silence = [], 0
     for i, st in enumerate(starts):
         seg = wav16[st: st + win]
-        res = asr.generate(input=seg, cache={}, language="zh", use_itn=True)
-        parsed = parse_rich(res[0]["text"])
+        if float(np.sqrt(np.mean(seg ** 2))) < RMS_SKIP:
+            n_silence += 1
+        else:
+            active.append((i, st))
+    starts_active = [st for _, st in active]
+    print(f"energy gate: skipped {n_silence} silent windows")
+
+    t0 = time.time()
+    if jobs > 1:
+        raw = parallel_transcribe(wav16, starts_active, jobs)
+    else:
+        print("loading model...")
+        asr = AutoModel(model="iic/SenseVoiceSmall", disable_update=True,
+                        device=funasr_device())
+        raw = {}
+        for k, (i, st) in enumerate(active):
+            res = asr.generate(input=wav16[st: st + win], cache={},
+                               language="zh", use_itn=True)
+            raw[i] = res[0]["text"]
+            if (k + 1) % 10 == 0:
+                print(f"  asr {k + 1}/{len(active)}")
+
+    # serial merge, window order preserved
+    records = []
+    accum = ""
+    n_blank = 0
+    for i, st in active:
+        seg = wav16[st: st + win]
+        parsed = parse_rich(raw[i])
         text = clean_text(parsed)
         emotion = next((p["emotion"] for p in parsed if p.get("emotion")), None)
 
         if is_degenerate(text):
             n_blank += 1
-            if (i + 1) % 10 == 0:
-                print(f"  win {i + 1}/{len(starts)} (blank={n_blank})")
             continue
 
         new_part, used = align_merge(accum, text)
         accum += new_part
         if new_part.strip(PUNCT):
-            # time estimate: unconsumed part of this window maps linearly
             frac = used / max(1, len(text))
             est_start = st / 16000 + frac * (len(seg) / 16000)
             records.append({
@@ -122,21 +195,21 @@ def main():
                 "text": new_part.strip(),
                 "emotion": emotion,
             })
-        if (i + 1) % 10 == 0:
-            print(f"  win {i + 1}/{len(starts)} (blank={n_blank})")
 
     elapsed = time.time() - t0
 
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
         json.dump({"file": wav_path, "elapsed_sec": elapsed,
                    "windows": len(starts), "blank_windows": n_blank,
+                   "silent_windows_skipped": n_silence, "jobs": jobs,
                    "win_s": WIN_S, "stride_s": STRIDE_S,
                    "sentences": records}, f, ensure_ascii=False, indent=1)
 
     with open(out_prefix + ".txt", "w", encoding="utf-8") as f:
         f.write(f"# {os.path.basename(wav_path)}  no-VAD sliding window "
-                f"({WIN_S}s/{STRIDE_S}s)\n")
-        f.write(f"# windows={len(starts)} blank={n_blank} elapsed={elapsed:.0f}s\n\n")
+                f"({WIN_S}s/{STRIDE_S}s, jobs={jobs})\n")
+        f.write(f"# windows={len(starts)} silent_skipped={n_silence} "
+                f"blank={n_blank} elapsed={elapsed:.0f}s\n\n")
         for r in records:
             emo = f" ({r['emotion']})" if r["emotion"] and r["emotion"] != "NEUTRAL" else ""
             f.write(f"[{r['start']}] {r['text']}{emo}\n")

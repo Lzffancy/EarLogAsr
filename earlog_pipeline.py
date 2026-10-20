@@ -20,6 +20,7 @@ from funasr import AutoModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sensevoice_transcribe import parse_rich, fmt_ts
+from device_config import funasr_device
 
 MERGE_GAP_MS = 400      # merge VAD segments with gap below this
 MERGE_MAX_MS = 15000    # chunk max duration
@@ -70,9 +71,9 @@ def main():
     wav16 = torchaudio.functional.resample(torch.from_numpy(audio).unsqueeze(0), sr, 16000)[0].numpy()
 
     print("loading models...")
-    vad = AutoModel(model="fsmn-vad", disable_update=True, device="cpu")
-    asr = AutoModel(model="iic/SenseVoiceSmall", disable_update=True, device="cpu")
-    spk = AutoModel(model="cam++", disable_update=True, device="cpu")
+    vad = AutoModel(model="fsmn-vad", disable_update=True, device=funasr_device())
+    asr = AutoModel(model="iic/SenseVoiceSmall", disable_update=True, device=funasr_device())
+    spk = AutoModel(model="cam++", disable_update=True, device=funasr_device())
 
     t0 = time.time()
     segments = vad.generate(input=wav16)[0]["value"]

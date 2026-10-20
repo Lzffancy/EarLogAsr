@@ -11,6 +11,9 @@ os.environ.setdefault("MODELSCOPE_CACHE", os.path.expanduser("~/.cache/modelscop
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from device_config import funasr_device
+
 LANG_TAGS = {"zh", "en", "yue", "ja", "ko"}
 EMOTION_TAGS = {"HAPPY", "SAD", "ANGRY", "NEUTRAL", "FEARFUL", "DISGUSTED", "SURPRISED", "EMO_UNKNOWN"}
 EVENT_TAGS = {"Speech", "Applause", "Laughter", "Cry", "Sneeze", "Breath", "Cough", "Music",
@@ -65,7 +68,7 @@ def main():
         model="iic/SenseVoiceSmall",
         vad_model="fsmn-vad",
         vad_kwargs={"max_single_segment_time": 30000},
-        device="cpu",
+        device=funasr_device(),
         disable_update=True,
     )
 

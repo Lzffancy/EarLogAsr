@@ -26,6 +26,7 @@ from funasr import AutoModel
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from earlog_pipeline import cluster
 from sensevoice_transcribe import fmt_ts
+from device_config import funasr_device
 
 WIN_S = 4.0      # embedding window
 HOP_S = 2.0      # hop
@@ -103,7 +104,7 @@ def main():
     total_s = len(wav16) / 16000
 
     print("loading cam++...")
-    spk = AutoModel(model="cam++", disable_update=True, device="cpu")
+    spk = AutoModel(model="cam++", disable_update=True, device=funasr_device())
 
     win, hop = int(WIN_S * 16000), int(HOP_S * 16000)
     starts = list(range(0, max(1, len(wav16) - win + 1), hop))

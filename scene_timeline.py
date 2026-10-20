@@ -16,6 +16,9 @@ import soundfile as sf
 import torch
 import torchaudio
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from device_config import panns_device
+
 WIN_S = 10.0
 HOP_S = 10.0
 TOP_K = 3
@@ -36,7 +39,7 @@ def main():
     out_prefix = sys.argv[2]
 
     from panns_inference import AudioTagging, labels
-    at = AudioTagging(checkpoint_path=None, device="cpu")
+    at = AudioTagging(checkpoint_path=None, device=panns_device())
 
     print("loading audio...")
     audio, sr = sf.read(wav_path, dtype="float32")
