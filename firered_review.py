@@ -74,7 +74,7 @@ def merge_segments(flagged):
     return [(max(0, st - PAD_S), ed + PAD_S, sorted(r)) for st, ed, r in out]
 
 
-def load_firered():
+def load_firered(force_no_vad=False):
     repo = os.environ.get("FIRERED_REPO", os.path.join(HERE, "..", "FireRedASR2S"))
     aed = os.environ.get("FIRERED_AED_DIR", os.path.join(
         HERE, "..", "models/models/xukaituo--FireRedASR2-AED/snapshots/master"))
@@ -91,7 +91,7 @@ def load_firered():
     # the SV text in the report is the fallback. FIRERED_REVIEW_VAD=0 turns
     # VAD off (better recall on borderline segments, but no sub-segment
     # timestamps).
-    use_vad = os.environ.get("FIRERED_REVIEW_VAD", "1") == "1"
+    use_vad = (os.environ.get("FIRERED_REVIEW_VAD", "1") == "1") and not force_no_vad
     vad_threshold = float(os.environ.get("FIRERED_VAD_THRESHOLD", "0.25"))
     if use_vad and not os.path.exists(vad):
         sys.exit(f"missing FIRERED_VAD_DIR: {vad}")
@@ -183,6 +183,7 @@ def main():
 
     print("loading FireRedASR2-AED...")
     system = load_firered()
+    system_novad = None          # lazy: only built when a segment comes back empty
     import logging
     logging.getLogger("fireredasr2s.asr_system").setLevel(logging.WARNING)
 
@@ -195,7 +196,25 @@ def main():
         sf.write(tmp, seg_i16, 16000, subtype="PCM_16")
         t0 = time.time()
         res = system.process(tmp)
+        retried = False
+        if not res["sentences"]:
+            # empty with VAD on: retry once without VAD (better recall on
+            # borderline low-volume speech, loses sub-segment timestamps)
+            if system_novad is None:
+                print("  [retry] building no-VAD fallback system...")
+                system_novad = load_firered(force_no_vad=True)
+            res2 = system_novad.process(tmp)
+            if res2["sentences"]:
+                res, retried = res2, True
         os.unlink(tmp)
+        if retried:
+            # no-VAD pass returns segment-relative utterances without reliable
+            # offsets; spread them evenly across the segment
+            n = len(res["sentences"])
+            step = (ed - st) / max(1, n)
+            for j, s in enumerate(res["sentences"]):
+                s["start_ms"] = int((st + j * step) * 1000)
+                s["end_ms"] = int((st + (j + 1) * step) * 1000)
         sv_text = "".join(s["text"] for s in sentences
                           if s["end_s"] > st and s["start_s"] < ed)
         fr_sents = [{"start_s": round(st + s["start_ms"] / 1000, 2),
@@ -203,6 +222,7 @@ def main():
                      "text": s["text"]} for s in res["sentences"]]
         results.append({"start_s": st, "end_s": ed, "reasons": reasons,
                         "sv_text": sv_text, "fr_sentences": fr_sents,
+                        "retried_novad": retried,
                         "elapsed_s": round(time.time() - t0, 1)})
         print(f"  [{k + 1}/{len(segments)}] {fmt(st)}-{fmt(ed)} "
               f"({ed - st:.0f}s, {time.time() - t0:.0f}s, {','.join(reasons)})")
