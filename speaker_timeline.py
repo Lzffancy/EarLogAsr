@@ -52,8 +52,37 @@ def labels_to_turns(labels, hop_s, total_s):
         if turns and turns[-1][2] == lab and st - turns[-1][1] <= hop_s:
             turns[-1][1] = ed
         else:
-            turns.append([st, ed, int(lab)])
+            turns.append([st, ed, lab])
     return [t for t in turns if t[1] - t[0] >= MIN_TURN_S]
+
+
+def verify_assign(X, vp_path, thr):
+    """Match each hop embedding against enrolled voiceprints (cosine)."""
+    vp = json.load(open(vp_path, encoding="utf-8"))
+    names = list(vp.keys())
+    C = np.stack([vp[n]["centroid"] for n in names])
+    sims = X @ C.T
+    best = sims.argmax(axis=1)
+    labels = np.array([names[b] if sims[i, b] >= thr else ""
+                       for i, b in enumerate(best)], dtype=object)
+    return labels, sims, names
+
+
+def hybrid_labels(X, vp_path, vthr, cthr, n_speakers):
+    """Enrolled speakers by verification; the rest fall back to clustering."""
+    labels, sims, names = verify_assign(X, vp_path, vthr)
+    mask = np.array([l == "" for l in labels])
+    print(f"  verify: {(~mask).sum()}/{len(labels)} hops matched (thr={vthr})")
+    for i, n in enumerate(names):
+        s = sims[:, i]
+        print(f"    {n}: sim p50={np.percentile(s, 50):.2f} "
+              f"p90={np.percentile(s, 90):.2f} max={s.max():.2f} "
+              f"hits={(labels == n).sum()}")
+    if mask.any():
+        sub = cluster(X[mask], cthr, n_speakers)
+        for j, lab in zip(np.where(mask)[0], sub):
+            labels[j] = f"C{int(lab):02d}"
+    return labels
 
 
 def write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path):
@@ -62,11 +91,16 @@ def write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path):
     dur = {}
     for st, ed, lab in turns:
         dur[lab] = dur.get(lab, 0) + (ed - st)
-    order = {lab: rank for rank, (lab, _) in enumerate(
-        sorted(dur.items(), key=lambda kv: -kv[1]))}
-    turns_out = [[int(st * 1000), int(ed * 1000), f"SPK{order[lab]:02d}"]
+    # enrolled names (str) pass through; cluster ids "Cxx" get ranked
+    cid_order = {lab: rank for rank, (lab, _) in enumerate(
+        sorted(((l, d) for l, d in dur.items() if str(l).startswith("C")),
+               key=lambda kv: -kv[1]))}
+    def disp(lab):
+        return f"SPK{cid_order[lab]:02d}" if str(lab).startswith("C") else str(lab)
+    turns_out = [[int(st * 1000), int(ed * 1000), disp(lab)]
                  for st, ed, lab in turns]
-    stats = {f"SPK{order[l]:02d}": round(d / 60, 1) for l, d in dur.items()}
+    stats = {disp(l): round(d / 60, 1) for l, d in
+             sorted(dur.items(), key=lambda kv: -kv[1])}
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
         json.dump({"file": wav_path, "elapsed_sec": elapsed,
                    "win_s": WIN_S, "hop_s": HOP_S, "threshold": threshold,
@@ -76,18 +110,35 @@ def write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path):
           f"elapsed={elapsed:.0f}s minutes={stats}")
 
 
-def recluster(emb_path, out_prefix, threshold):
+def parse_verify(argv):
+    """--verify voiceprints.json [vthr] -> (vp_path, vthr) or (None, None)."""
+    if "--verify" not in argv:
+        return None, None
+    i = argv.index("--verify")
+    vp = argv[i + 1]
+    vthr = float(argv[i + 2]) if len(argv) > i + 2 and \
+        not argv[i + 2].startswith("--") else 0.45
+    return vp, vthr
+
+
+def recluster(emb_path, out_prefix, threshold, vp_path=None, vthr=0.45):
     n_speakers = int(os.environ.get("EARLOG_N_SPK", "0")) or None
     X = np.load(emb_path)
     total_s = len(X) * HOP_S + WIN_S
-    labels = cluster(X, threshold, n_speakers)
+    if vp_path:
+        labels = hybrid_labels(X, vp_path, vthr, threshold, n_speakers)
+    else:
+        labels = cluster(X, threshold, n_speakers)
     write_turns(labels, total_s, out_prefix, threshold, 0, emb_path)
 
 
 def main():
+    vp_path, vthr = parse_verify(sys.argv)
     if sys.argv[1] == "--recluster":
         recluster(sys.argv[2], sys.argv[3],
-                  float(sys.argv[4]) if len(sys.argv) > 4 else 0.8)
+                  float(sys.argv[4]) if len(sys.argv) > 4 and
+                  not sys.argv[4].startswith("--") else 0.8,
+                  vp_path, vthr or 0.45)
         return
 
     wav_path = sys.argv[1]
@@ -122,7 +173,10 @@ def main():
     X = np.stack(embs)
     np.save(out_prefix + "_emb.npy", X)
 
-    labels = cluster(X, threshold, n_speakers)
+    if vp_path:
+        labels = hybrid_labels(X, vp_path, vthr, threshold, n_speakers)
+    else:
+        labels = cluster(X, threshold, n_speakers)
     elapsed = time.time() - t0
     print(f"  emb done, clustering... ({elapsed:.0f}s)")
     write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path)
