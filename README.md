@@ -1,66 +1,143 @@
 # EarLogAsr
 
-录音笔长音频的本地离线分析管线（中文场景，CPU 可跑，有 GPU 自动加速）。
+录音笔长音频的本地离线分析管线。输入是几小时的连续录音，输出是带说话人、场景、置信度标记的结构化转写（JSONL），供上层 LLM 做校准、摘要和日程还原。
 
-架构：ASR 层三条流 → 统一时间轴 JSONL → LLM 层还原。
+设计约束：中文语音、CPU 可跑（有 GPU 自动加速）、每天约 8 小时录音量、不允许丢失任何语音内容。
 
-## 设备兼容
+## 架构
 
-所有脚本通过 `device_config.py` 自动探测设备：`torch.cuda.is_available()` 为真就走 `cuda:0`，否则回落 CPU。无需改代码。
-
-```bash
-# 强制指定设备（可选）
-EARLOG_DEVICE=cpu python slidewin_pipeline.py ...     # 有 GPU 也强制用 CPU
-EARLOG_DEVICE=cuda:0 python slidewin_pipeline.py ...  # 显式指定卡
+```
+                    ┌─ speaker_timeline.py  CAM++ 小滑窗声纹 → 说话人流
+原始音频（全长） ────┼─ scene_timeline.py    PANNs 场景标签   → 场景流
+                    └─ slidewin_pipeline.py SenseVoice 滑窗   → 内容流
+                                      │
+                          fuse.py 三流对齐到统一时间轴
+                                      │
+                fused_xxx.jsonl {start, end, spk, scene, text, conf}
+                                      │
+                    （可选）firered_review.py 低置信段复核回灌
+                                      │
+                              LLM 层（不碰音频）
 ```
 
-GPU 模式下注意：
+核心原则：**ASR 层与 LLM 层的唯一接口是 JSONL**。LLM 层只读文本不碰音频，两层可独立迭代。
 
-- `slidewin_pipeline.py` 的多进程参数 `jobs` 会被强制为 1（多进程抢一张卡只会 OOM）；GPU 本身够快，不需要多进程
-- GPU 机器装 CUDA 版 torch：`pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121`（torch 与 torchaudio 版本必须一致）
-- 3050 4G 笔记本实测可跑全部三条流（SenseVoice/CAM++/PANNs 都是小模型，显存占用 <1GB）
+## 各部分构成与为什么这么做
 
-## 管线
+### 内容流：无 VAD 重叠滑窗（`slidewin_pipeline.py`）
 
-```bash
-# 1. 内容流：无 VAD 滑窗（30s窗/20s步长）+ SenseVoice + 重叠对齐去重
-python slidewin_pipeline.py <wav> sw_xxx
+30 秒窗、20 秒步长（10 秒重叠）覆盖全音频，每窗独立送 SenseVoice-Small，窗口间用模糊后缀-前缀对齐（difflib，ratio≥0.70）去重，串行合并出全文。
 
-# 2. 说话人流：CAM++ 小滑窗声纹聚类（EARLOG_N_SPK=k 走谱聚类）
-python speaker_timeline.py <wav> spk_xxx
-python speaker_timeline.py --recluster spk_xxx_emb.npy spk_xxx [阈值]  # 免重跑调聚类
+**为什么不走 VAD 前置切分**：实测 VAD（fsmn-vad、silero-vad 单独或并集）在低音量远场段会判静音并丢弃语音。丢失发生在 ASR 之前，后端模型再强也见不到这段音频——MIC006 实测双 VAD 并集仍漏 60 处。滑窗方案把"是否是语音"的判断从声学前验改成识别后验：纯噪声窗由退化过滤器拦截（输出为纯标点、或单字符占比 >0.7 则丢弃），判断依据是"识别出来像不像话"而非"听起来像不像语音"，前者误杀率明显更低。
 
-# 3. 场景流：PANNs CNN14 场景标签
-python scene_timeline.py <wav> sc_xxx
+**代价与边界**：重叠区重复计算，算力约为 VAD 方案的 1.5 倍，离线批处理可接受；实时流式场景不适用。单窗 30 秒是 SenseVoice 的有效长度上限，更长会截断。
 
-# 4. 融合：三流对齐到统一时间轴
-python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.json
+### 说话人流：注册验证 + 聚类混合（`speaker_timeline.py`、`enroll_speaker.py`）
 
-# 5. 复核（可选）：低置信段用 FireRedASR2-AED 重转写，拿回完整句+精确时间戳
-python firered_review.py <wav> sw_xxx sw_xxx_review
-python firered_review.py <wav> sw_xxx sw_xxx_review --ranges=24:00-30:00  # 手动指定段
+CAM++ 在 4 秒窗 / 2 秒步长上逐窗提取声纹 embedding，两种模式：
+
+- **聚类模式**（默认）：层次聚类（余弦距离）或 `EARLOG_N_SPK=k` 谱聚类，适合完全未知的录音
+- **验证模式**（`--verify voiceprints.json`）：每窗与注册声纹质心算余弦相似度，≥阈值（默认 0.45）直接标姓名；未命中回落聚类
+
+`enroll_speaker.py` 从已有转写稿按说话人标签抽段，平均 embedding 得注册质心。
+
+**为什么混合**：纯聚类在远场小窗上会分裂或并簇（实测同一人户外/室内被分成两簇、两个汇报人并簇）；注册验证分离度实测良好（本人命中段相似度 >0.40，他人 p90=0.19），但只覆盖注册过的人。回落聚类保证未知说话人仍有标签。
+
+**已知边界**：turn 切换点可靠；说话人时长统计在远场小窗下有偏差；聚类并簇会连带影响按簇的自动改名。
+
+### 场景流（`scene_timeline.py`）
+
+PANNs CNN14 在 10 秒窗上出 AudioSet 标签（白名单过滤到生活场景类别）。无人声段的场景（地铁、雨声、街道）只有声学路径能拿到——内容流在无人声时不出文本，文本层无米下锅。
+
+**为什么不用 SenseVoice 的事件标签**：实测其在非语音段几乎不产出（48 个无人声段只报出 2 个标签），且噪声段会幻听文本。
+
+### 融合（`fuse.py`）
+
+三流按时间轴对齐：每条文本按时间重叠量分配说话人 turn 和场景标签，产出统一 JSONL：
+
+```
+{"start_ms", "end_ms", "spk", "scene", "text", "emotion", "conf"}
 ```
 
-复核通道说明：
+### 复核第二通道（`firered_review.py`，可选）
+
+SenseVoice 是速度优先（RTF≈0.07）；FireRedASR2-AED 质量优先（句级原生时间戳、低音量召回最强，但 RTF 0.2–0.7、模型 4.7GB）。分工：SenseVoice 跑全量，FireRedASR2 只复核低置信段。
 
 - 低置信判定：叠字/重复率 >0.30、标点占比 >0.35、活跃段语速 <1 字/秒；相邻标记合并成 ≤90s 复核段
-- 复核预算默认封顶音频时长的 20%（`EARLOG_REVIEW_MAX_FRAC` 可调），按严重度排序取舍
-- 依赖仓库外的 FireRedASR2S（不入库）：`FIRERED_REPO` / `FIRERED_AED_DIR` / `FIRERED_VAD_DIR` 指路径
-- FireRedVAD 阈值默认降到 0.25（`FIRERED_VAD_THRESHOLD`），否则会滤掉正是要复核的低音量语音；`FIRERED_REVIEW_VAD=0` 可整体关 VAD（召回略高但没有段内时间戳）
-- AED 对极低音量段会返回 `<sil>` 被判空——这是真实能力下限，此时报告里以 SV 原文为准
+- 复核预算默认封顶音频时长的 20%（`EARLOG_REVIEW_MAX_FRAC`），按严重度加权取舍
+- FireRedVAD 阈值默认降到 0.25（`FIRERED_VAD_THRESHOLD`），否则滤掉的正是要复核的低音量语音；FR 返回空的段自动降级无 VAD 重试一次；仍空保留 SenseVoice 原文——这是 FR 的真实能力下限
+- 复核结果用 `fuse.py --review` 回灌：FR 句子替换对应区间，时间戳升级为句级精确值，标记 `conf=reviewed`
+
+### 说话人锚定（`anchor_speakers.py`）
+
+扫描自报家门句式（"大家好我是X"）把聚类标签映射为姓名。带问候语境的判高置信才自动应用；其余保留证据供人工确认。注册表存 `speakers_registry.json`，`fuse.py --names` 应用。
+
+## 使用
+
+```bash
+# 1. 三条流
+python slidewin_pipeline.py <wav> sw_xxx [--jobs N]
+EARLOG_N_SPK=5 python speaker_timeline.py <wav> spk_xxx
+python scene_timeline.py <wav> sc_xxx
+
+# 2. 融合
+python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.json
+
+# 3. 可选：复核 + 回灌 + 锚定
+python firered_review.py <wav> sw_xxx sw_xxx_review [--ranges=24:00-30:00] [--all]
+python anchor_speakers.py fused_xxx.jsonl
+python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.json \
+    --review sw_xxx_review.json --names speakers_registry.json
+
+# 4. 可选：声纹注册 + 验证模式
+python enroll_speaker.py 姓名 fused_xxx.jsonl SPKxx
+python speaker_timeline.py --recluster spk_xxx_emb.npy spk_xxx_v --verify voiceprints.json
+```
+
+每个 `*_emb.npy` 都保留，调聚类参数用 `--recluster` 免重跑 ASR。
+
+## 优化设计
+
+实测环境 i7-9700（8 核 CPU），30 分钟音频：内容流 133s、说话人流 75s、场景流 44–104s，全链合约 4 分钟；8 小时录音约 70 分钟。
+
+- **RMS 能量门**：真静音窗（RMS<1e-3）直接跳过 ASR。与 VAD 不同——只拦"什么声音都没有"，不做语音/噪声判断，零误杀风险。对含大段空白的录音（如夜间）节省线性时间
+- **`--jobs N` 进程池**：窗口级并行。实测本机无增益（单进程 torch 已占满 8 核），保留给多核大机。注意不同线程数改变浮点归约顺序，输出有 ±0.5% 字面漂移
+- **已验证无效的方向**：批量推理只快 6% 且输出漂移明显；CPU 饱和机器上进程并发为负收益
+- **未做的杠杆**：int8 量化（约 2 倍）、重叠减到 5s（省 17%）、GPU（RTF 可到 0.01 量级）
+
+## 兼容性
+
+`device_config.py` 自动探测设备：`torch.cuda.is_available()` 为真走 `cuda:0`（fp16），否则 CPU（fp32）。`EARLOG_DEVICE=cuda:0/cpu` 强制覆盖，无需改代码。
+
+GPU 模式注意：
+
+- `slidewin_pipeline.py` 的 `jobs` 会被强制为 1（多进程抢一张卡只会 OOM；GPU 本身够快）
+- 装 CUDA 版 torch：`pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121`
+- 3050 4G 笔记本实测可跑全部三条流（SenseVoice/CAM++/PANNs 显存占用 <1GB）
+
+其它：
+
+- Python 3.10 验证通过；**torch 与 torchaudio 版本必须一致**（不一致在 Windows 报 WinError 127）
+- panns_inference 官方下载脚本依赖 wget，Windows 需手动下载权重到 `~/panns_data/`
+- silero-vad（历史模块用）torch 模型带循环状态，必须逐 chunk 顺序推理，批量输入输出失真
+- FireRedASR2 不内置于本仓库：`FIRERED_REPO` / `FIRERED_AED_DIR` / `FIRERED_VAD_DIR` 指向外部路径
 
 ## 模块
 
 - `sensevoice_transcribe.py`：SenseVoice 富标签解析（parse_rich / fmt_ts），也可独立转写
 - `earlog_pipeline.py`：聚类与段合并工具库（cluster / merge_segments）
-- `device_config.py`：设备自动探测（GPU/CPU 回落），被所有管线脚本 import，勿删
-- `firered_review.py`：复核第二通道（低置信段 → FireRedASR2-AED 重转写）
+- `device_config.py`：设备自动探测，被所有管线脚本 import，勿删
+- `firered_review.py`：复核第二通道
+- `enroll_speaker.py` / `anchor_speakers.py`：声纹注册 / 自报家门锚定
 
-## 依赖
+## 方案取舍记录
 
-- funasr 1.4.x（SenseVoiceSmall / fsmn-vad / cam++，模型走 ModelScope 缓存）
-- torch + torchaudio（版本必须一致）
-- silero-vad、panns_inference（PANNs 权重需手动放到 ~/panns_data/）
-- soundfile、numpy、scikit-learn
-
-输出 JSONL 每行：`{start_ms, end_ms, spk, scene, text, emotion, conf}`，供 LLM 层消费。
+| 取舍 | 选择 | 放弃 | 依据 |
+|---|---|---|---|
+| 切分 | 无 VAD 滑窗 | VAD 前置 | 双 VAD 并集仍漏 60 处低音量语音（MIC006 实测） |
+| 主力 ASR | SenseVoice-Small | Paraformer / Qwen3-ASR / Fun-ASR-Nano | 速度 ×2、低音量召回最强、CPU 可行；Paraformer 仅时间戳占优 |
+| 复核 | FireRedASR2-AED 按需复核 | 全量跑 FR | RTF 0.2–0.7，8 小时录音 CPU 跑不动全量 |
+| 说话人 | 注册验证+聚类混合 | 纯聚类 | 远场小窗聚类分裂/并簇 |
+| 场景 | PANNs 专用 AED | SenseVoice 事件标签 | 后者在非语音段几乎不产出 |
+| 情绪 | SenseVoice 顺带输出 | 专用模型 | 嘈杂段误报多，只当辅助信号 |
+| 并发 | 进程池（保留） | 线程级并发 | torch 内部已多线程，线程并发互相抢核 |
