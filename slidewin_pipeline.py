@@ -198,6 +198,7 @@ def main():
 
     elapsed = time.time() - t0
 
+    os.makedirs(os.path.dirname(os.path.abspath(out_prefix)), exist_ok=True)
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
         json.dump({"file": wav_path, "elapsed_sec": elapsed,
                    "windows": len(starts), "blank_windows": n_blank,

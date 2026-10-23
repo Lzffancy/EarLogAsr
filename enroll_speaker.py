@@ -48,12 +48,19 @@ def main():
     name = sys.argv[1]
     if sys.argv[2].endswith(".jsonl"):
         jsonl_path, spk_label = sys.argv[2], sys.argv[3]
-        # wav path lives in the sibling sw_*.json referenced by fused txt header
+        # wav path lives in the sibling fused txt header; older runs wrote only
+        # the basename there, so fall back to the sw json when that does not open
         import re
         head = open(jsonl_path.replace(".jsonl", ".txt"),
                     encoding="utf-8").readline()
-        m = re.match(r"# (\S+\.wav)", head)
+        m = re.match(r"# (.+?)\s\s+fused timeline", head)
         wav_path = m.group(1) if m else sys.exit("wav not found in fused txt")
+        if not os.path.exists(wav_path):
+            sw = jsonl_path.replace("_fused.jsonl", "_sw.json")
+            if os.path.exists(sw):
+                wav_path = json.load(open(sw, encoding="utf-8"))["file"]
+            else:
+                sys.exit(f"wav not found: {wav_path}")
         ranges = segments_from_jsonl(jsonl_path, spk_label)
     else:
         wav_path = sys.argv[2]
@@ -71,6 +78,8 @@ def main():
             continue
         seg = wav16[int(st * 16000):int(ed * 16000)]
         emb = spk.generate(input=seg)[0]["spk_embedding"]
+        if hasattr(emb, "detach"):          # GPU: funasr returns a cuda tensor
+            emb = emb.detach().cpu()
         emb = np.asarray(emb, dtype=np.float32).flatten()
         embs.append(emb / (np.linalg.norm(emb) + 1e-8))
         used += ed - st

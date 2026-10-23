@@ -26,7 +26,7 @@ from funasr import AutoModel
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from earlog_pipeline import cluster
 from sensevoice_transcribe import fmt_ts
-from device_config import funasr_device
+from device_config import speaker_device
 
 WIN_S = 4.0      # embedding window
 HOP_S = 2.0      # hop
@@ -91,16 +91,21 @@ def write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path):
     dur = {}
     for st, ed, lab in turns:
         dur[lab] = dur.get(lab, 0) + (ed - st)
-    # enrolled names (str) pass through; cluster ids "Cxx" get ranked
+    # enrolled names (str) pass through; cluster ids get ranked.
+    # cluster() returns ints; hybrid_labels() returns "Cxx" -- handle both,
+    # otherwise single-speaker runs label turns "0" instead of "SPK00".
+    def is_cluster(lab):
+        return isinstance(lab, (int, np.integer)) or str(lab).startswith("C")
     cid_order = {lab: rank for rank, (lab, _) in enumerate(
-        sorted(((l, d) for l, d in dur.items() if str(l).startswith("C")),
+        sorted(((l, d) for l, d in dur.items() if is_cluster(l)),
                key=lambda kv: -kv[1]))}
     def disp(lab):
-        return f"SPK{cid_order[lab]:02d}" if str(lab).startswith("C") else str(lab)
+        return f"SPK{cid_order[lab]:02d}" if is_cluster(lab) else str(lab)
     turns_out = [[int(st * 1000), int(ed * 1000), disp(lab)]
                  for st, ed, lab in turns]
     stats = {disp(l): round(d / 60, 1) for l, d in
              sorted(dur.items(), key=lambda kv: -kv[1])}
+    os.makedirs(os.path.dirname(os.path.abspath(out_prefix)), exist_ok=True)
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
         json.dump({"file": wav_path, "elapsed_sec": elapsed,
                    "win_s": WIN_S, "hop_s": HOP_S, "threshold": threshold,
@@ -132,6 +137,30 @@ def recluster(emb_path, out_prefix, threshold, vp_path=None, vthr=0.45):
     write_turns(labels, total_s, out_prefix, threshold, 0, emb_path)
 
 
+def _is_float(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def positionals(argv):
+    """argv[3:] minus flags and their values, in order. --verify eats one value,
+    so `speaker_timeline.py a.wav out --verify vp.json` does not read vp.json as
+    the clustering threshold."""
+    out, skip = [], False
+    for a in argv[3:]:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("--"):
+            skip = a == "--verify"
+            continue
+        out.append(a)
+    return out
+
+
 def main():
     vp_path, vthr = parse_verify(sys.argv)
     if sys.argv[1] == "--recluster":
@@ -143,7 +172,11 @@ def main():
 
     wav_path = sys.argv[1]
     out_prefix = sys.argv[2]
-    threshold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.8
+    pos = positionals(sys.argv)
+    if "--threshold" in sys.argv:
+        threshold = float(sys.argv[sys.argv.index("--threshold") + 1])
+    else:
+        threshold = float(pos[0]) if pos and _is_float(pos[0]) else 0.8
     n_speakers = int(os.environ.get("EARLOG_N_SPK", "0")) or None
 
     print("loading audio...")
@@ -154,8 +187,8 @@ def main():
         torch.from_numpy(audio).unsqueeze(0), sr, 16000)[0].numpy()
     total_s = len(wav16) / 16000
 
-    print("loading cam++...")
-    spk = AutoModel(model="cam++", disable_update=True, device=funasr_device())
+    print(f"loading cam++... (device={speaker_device()})")
+    spk = AutoModel(model="cam++", disable_update=True, device=speaker_device())
 
     win, hop = int(WIN_S * 16000), int(HOP_S * 16000)
     starts = list(range(0, max(1, len(wav16) - win + 1), hop))
@@ -166,6 +199,8 @@ def main():
     for i, st in enumerate(starts):
         seg = wav16[st: st + win]
         emb = spk.generate(input=seg)[0]["spk_embedding"]
+        if hasattr(emb, "detach"):          # GPU: funasr returns a cuda tensor
+            emb = emb.detach().cpu()
         emb = np.asarray(emb, dtype=np.float32).flatten()
         embs.append(emb / (np.linalg.norm(emb) + 1e-8))
         if (i + 1) % 100 == 0:

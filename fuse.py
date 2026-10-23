@@ -141,7 +141,7 @@ def main():
 
     # readable view: group consecutive rows by speaker
     with open(args.out_prefix + ".txt", "w", encoding="utf-8") as f:
-        src = os.path.basename(content["file"])
+        src = content["file"]          # full path: enroll_speaker.py reads it back
         f.write(f"# {src}  fused timeline\n")
         f.write(f"# rows={len(rows)} "
                 f"low_conf={sum(1 for r in rows if r['conf'] == 'low')}\n\n")

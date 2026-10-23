@@ -100,20 +100,35 @@ python speaker_timeline.py --recluster spk_xxx_emb.npy spk_xxx_v --verify voicep
 
 实测环境 i7-9700（8 核 CPU），30 分钟音频：内容流 133s、说话人流 75s、场景流 44–104s，全链合约 4 分钟；8 小时录音约 70 分钟。
 
+**GPU 实测**（2026-10-21，RTX 3050 Laptop 4GB，30 分钟真实录音同文件对照）：
+
+| 流 | CPU | GPU | 加速 | 输出 |
+|---|---|---|---|---|
+| 内容流 SenseVoice | 177s | 27s | **6.6×** | 56 段 / 651 字逐字一致 |
+| 场景流 PANNs | 33s | 6s | 5.5× | 标签完全一致 |
+| 说话人流 CAM++ | 78s | 54s | 1.4× | emb 差 1.2e-3，聚类一致 |
+
+单窗 forward 2.0s → 0.23s，端到端 rtf 0.098 → 0.015。8 小时全链 77min → 23min。
+
 - **RMS 能量门**：真静音窗（RMS<1e-3）直接跳过 ASR。与 VAD 不同——只拦"什么声音都没有"，不做语音/噪声判断，零误杀风险。对含大段空白的录音（如夜间）节省线性时间
 - **`--jobs N` 进程池**：窗口级并行。实测本机无增益（单进程 torch 已占满 8 核），保留给多核大机。注意不同线程数改变浮点归约顺序，输出有 ±0.5% 字面漂移
 - **已验证无效的方向**：批量推理只快 6% 且输出漂移明显；CPU 饱和机器上进程并发为负收益
-- **未做的杠杆**：int8 量化（约 2 倍）、重叠减到 5s（省 17%）、GPU（RTF 可到 0.01 量级）
+- **未做的杠杆**：int8 量化（约 2 倍）、重叠减到 5s（省 17%）、GPU 端 fp16（当前全程 fp32，见兼容性一节）
 
 ## 兼容性
 
-`device_config.py` 自动探测设备：`torch.cuda.is_available()` 为真走 `cuda:0`（fp16），否则 CPU（fp32）。`EARLOG_DEVICE=cuda:0/cpu` 强制覆盖，无需改代码。
+`device_config.py` 自动探测设备：`torch.cuda.is_available()` 为真走 `cuda:0`，否则 CPU。`EARLOG_DEVICE=cuda:0/cpu` 强制覆盖，无需改代码。
+
+**当前实际精度是 fp32，不是 fp16**：FunASR 的 `AutoModel` 没有传 `use_half`，`device_config.py` 也只返回设备名，代码里没有任何 `.half()`。所以 GPU 上跑的是 fp32，fp16 仍是未兑现的加速余量。
+
+`speaker_device()` 是唯一例外：**说话人流默认锁定 CPU**，即使检测到 GPU。实测 CAM++ 在 GPU 上只有 1.4× 收益，却有约 60% 概率进程级静默崩溃（无 traceback、不落盘，只在首次崩时吐 `TORCH_USE_CUDA_DSA` 提示）。要赌就用 `EARLOG_SPK_DEVICE=cuda:0`，并自行加重试。
 
 GPU 模式注意：
 
 - `slidewin_pipeline.py` 的 `jobs` 会被强制为 1（多进程抢一张卡只会 OOM；GPU 本身够快）
 - 装 CUDA 版 torch：`pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121`
-- 3050 4G 笔记本实测可跑全部三条流（SenseVoice/CAM++/PANNs 显存占用 <1GB）
+- 3050 4G 笔记本实测显存峰值 **1872 MiB**（PANNs + CAM++ 会话），4GB 够用但余量不到一半，别同时开别的吃显存程序
+- **CUDA 版 torch 即使 `EARLOG_DEVICE=cpu`，import 时照样加载 cuDNN DLL**。Windows 页面文件偏小时会报 `OSError: [WinError 1455] 页面文件太小`，表现为启动阶段偶发失败（重跑通常就过），不是代码 bug，调大虚拟内存即可
 
 其它：
 

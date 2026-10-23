@@ -38,7 +38,12 @@ def merge_segments(segments):
 
 def cluster(X, threshold, n_speakers=None):
     from sklearn.cluster import AgglomerativeClustering, SpectralClustering
+    # a clip shorter than one hop yields a single embedding; sklearn needs >=2
+    # samples, and one sample can only ever be one speaker
+    if len(X) < 2:
+        return np.zeros(len(X), dtype=int)
     if n_speakers:
+        n_speakers = min(n_speakers, len(X))
         return SpectralClustering(
             n_clusters=n_speakers, affinity="cosine",
             random_state=0, assign_labels="kmeans",
@@ -93,6 +98,8 @@ def main():
         event = next((p["event"] for p in parsed if p.get("event")), None)
 
         emb = spk.generate(input=seg_audio)[0]["spk_embedding"]
+        if hasattr(emb, "detach"):          # GPU: funasr returns a cuda tensor
+            emb = emb.detach().cpu()
         emb = np.asarray(emb, dtype=np.float32).flatten()
         embeddings.append(emb / (np.linalg.norm(emb) + 1e-8))
 

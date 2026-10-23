@@ -74,6 +74,7 @@ def main():
             print(f"  scene {i + 1}/{len(starts)}")
 
     elapsed = time.time() - t0
+    os.makedirs(os.path.dirname(os.path.abspath(out_prefix)), exist_ok=True)
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
         json.dump({"file": wav_path, "elapsed_sec": elapsed,
                    "win_s": WIN_S, "hop_s": HOP_S, "windows": windows},
