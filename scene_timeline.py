@@ -34,26 +34,25 @@ KEEP = {
 }
 
 
-def main():
-    wav_path = sys.argv[1]
-    out_prefix = sys.argv[2]
+# ---------------- reusable core ----------------
+# run_day.py imports these so a day of files shares one interpreter and one
+# loaded PANNs instance.
 
-    from panns_inference import AudioTagging, labels
-    at = AudioTagging(checkpoint_path=None, device=panns_device())
-
-    print("loading audio...")
+def load_wav32(wav_path):
     audio, sr = sf.read(wav_path, dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-    wav32 = torchaudio.functional.resample(
+    return torchaudio.functional.resample(
         torch.from_numpy(audio).unsqueeze(0), sr, 32000)[0].numpy()
-    total_s = len(wav32) / 32000
 
+
+def tag(wav32, at, verbose=True):
+    """AudioSet tagging over 10s windows. Returns the windows list."""
+    from panns_inference import labels
     win, hop = int(WIN_S * 32000), int(HOP_S * 32000)
     starts = list(range(0, max(1, len(wav32) - win + 1), hop))
-    print(f"audio {total_s:.0f}s, windows: {len(starts)}")
-
-    t0 = time.time()
+    if verbose:
+        print(f"audio {len(wav32) / 32000:.0f}s, windows: {len(starts)}")
     windows = []
     for i, st in enumerate(starts):
         seg = wav32[st: st + win]
@@ -70,20 +69,39 @@ def main():
             "labels": labs,
             "probs": [round(float(probs[labels.index(l)]), 3) for l in labs],
         })
-        if (i + 1) % 30 == 0:
+        if verbose and (i + 1) % 30 == 0:
             print(f"  scene {i + 1}/{len(starts)}")
+    return windows
 
+
+def tag_file(wav_path, at, out_prefix, verbose=True):
+    """Scene stage for one file: load -> tag -> write json."""
+    wav32 = load_wav32(wav_path)
+    t0 = time.time()
+    windows = tag(wav32, at, verbose)
     elapsed = time.time() - t0
     os.makedirs(os.path.dirname(os.path.abspath(out_prefix)), exist_ok=True)
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
         json.dump({"file": wav_path, "elapsed_sec": elapsed,
                    "win_s": WIN_S, "hop_s": HOP_S, "windows": windows},
                   f, ensure_ascii=False, indent=1)
+    if verbose:
+        from collections import Counter
+        c = Counter(l for w in windows for l in w["labels"])
+        print(f"DONE {wav_path} windows={len(windows)} elapsed={elapsed:.0f}s")
+        print("label counts:", dict(c.most_common(10)))
+    return windows, elapsed
 
-    from collections import Counter
-    c = Counter(l for w in windows for l in w["labels"])
-    print(f"DONE {wav_path} windows={len(windows)} elapsed={elapsed:.0f}s")
-    print("label counts:", dict(c.most_common(10)))
+
+def main():
+    wav_path = sys.argv[1]
+    out_prefix = sys.argv[2]
+
+    from panns_inference import AudioTagging
+    at = AudioTagging(checkpoint_path=None, device=panns_device())
+
+    print("loading audio...")
+    tag_file(wav_path, at, out_prefix)
 
 
 if __name__ == "__main__":

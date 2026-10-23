@@ -30,6 +30,7 @@ WIN_S = 30        # window length
 STRIDE_S = 20     # stride (10s overlap)
 MIN_ALIGN = 6     # min chars for overlap alignment
 PUNCT = "。，、！？…—,.!?·~ "
+RMS_SKIP = 1e-3   # true-silence gate threshold (raw RMS, not VAD)
 
 
 def clean_text(parsed):
@@ -118,31 +119,30 @@ def parallel_transcribe(wav16, starts, jobs):
         os.unlink(tmp)
 
 
-def main():
-    wav_path = sys.argv[1]
-    out_prefix = sys.argv[2]
-    jobs = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    if on_gpu() and jobs > 1:
-        print("GPU mode: forcing jobs=1 (multi-process would contend for one GPU)")
-        jobs = 1
-    print(f"device: {describe()}")
+# ---------------- reusable core ----------------
+# run_day.py imports these so a whole day of files shares one interpreter and
+# one loaded model. Keep them free of CLI/argparse concerns.
 
-    print("loading audio...")
+
+def load_wav16(wav_path):
     audio, sr = sf.read(wav_path, dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-    wav16 = torchaudio.functional.resample(
+    return torchaudio.functional.resample(
         torch.from_numpy(audio).unsqueeze(0), sr, 16000)[0].numpy()
-    total_s = len(wav16) / 16000
 
+
+def window_starts(wav16):
     win, stride = WIN_S * 16000, STRIDE_S * 16000
     starts = list(range(0, max(1, len(wav16) - win + 1), stride))
     if len(wav16) - starts[-1] > 8 * 16000:   # tail worth transcribing
         starts.append(len(wav16) - win)
-    print(f"audio {total_s:.0f}s, windows: {len(starts)}, jobs={jobs}")
+    return starts
 
-    # energy gate: skip windows that are true silence (not VAD — raw RMS only)
-    RMS_SKIP = 1e-3
+
+def energy_gate(wav16, starts):
+    """True-silence gate (raw RMS only, not VAD). Returns (active, n_silence)."""
+    win = WIN_S * 16000
     active, n_silence = [], 0
     for i, st in enumerate(starts):
         seg = wav16[st: st + win]
@@ -150,25 +150,12 @@ def main():
             n_silence += 1
         else:
             active.append((i, st))
-    starts_active = [st for _, st in active]
-    print(f"energy gate: skipped {n_silence} silent windows")
+    return active, n_silence
 
-    t0 = time.time()
-    if jobs > 1:
-        raw = parallel_transcribe(wav16, starts_active, jobs)
-    else:
-        print("loading model...")
-        asr = AutoModel(model="iic/SenseVoiceSmall", disable_update=True,
-                        device=funasr_device())
-        raw = {}
-        for k, (i, st) in enumerate(active):
-            res = asr.generate(input=wav16[st: st + win], cache={},
-                               language="zh", use_itn=True)
-            raw[i] = res[0]["text"]
-            if (k + 1) % 10 == 0:
-                print(f"  asr {k + 1}/{len(active)}")
 
-    # serial merge, window order preserved
+def merge_windows(wav16, active, raw):
+    """Overlap-align per-window text into records. Returns (records, n_blank)."""
+    win = WIN_S * 16000
     records = []
     accum = ""
     n_blank = 0
@@ -195,30 +182,98 @@ def main():
                 "text": new_part.strip(),
                 "emotion": emotion,
             })
+    return records, n_blank
 
+
+def transcribe(wav16, asr, verbose=True):
+    """Sliding-window ASR for one already-loaded array.
+
+    Returns (records, stats). stats carries the counters the JSON header needs.
+    """
+    total_s = len(wav16) / 16000
+    starts = window_starts(wav16)
+    active, n_silence = energy_gate(wav16, starts)
+    if verbose:
+        print(f"audio {total_s:.0f}s, windows: {len(starts)}")
+        print(f"energy gate: skipped {n_silence} silent windows")
+
+    win = WIN_S * 16000
+    t0 = time.time()
+    raw = {}
+    for k, (i, st) in enumerate(active):
+        res = asr.generate(input=wav16[st: st + win], cache={},
+                           language="zh", use_itn=True)
+        raw[i] = res[0]["text"]
+        if verbose and (k + 1) % 10 == 0:
+            print(f"  asr {k + 1}/{len(active)}")
     elapsed = time.time() - t0
 
+    records, n_blank = merge_windows(wav16, active, raw)
+    return records, {"total_s": total_s, "windows": len(starts),
+                     "n_silence": n_silence, "n_blank": n_blank,
+                     "elapsed": elapsed}
+
+
+def write_outputs(out_prefix, wav_path, records, stats, jobs=1):
     os.makedirs(os.path.dirname(os.path.abspath(out_prefix)), exist_ok=True)
     with open(out_prefix + ".json", "w", encoding="utf-8") as f:
-        json.dump({"file": wav_path, "elapsed_sec": elapsed,
-                   "windows": len(starts), "blank_windows": n_blank,
-                   "silent_windows_skipped": n_silence, "jobs": jobs,
+        json.dump({"file": wav_path, "elapsed_sec": stats["elapsed"],
+                   "windows": stats["windows"],
+                   "blank_windows": stats["n_blank"],
+                   "silent_windows_skipped": stats["n_silence"], "jobs": jobs,
                    "win_s": WIN_S, "stride_s": STRIDE_S,
                    "sentences": records}, f, ensure_ascii=False, indent=1)
 
     with open(out_prefix + ".txt", "w", encoding="utf-8") as f:
         f.write(f"# {os.path.basename(wav_path)}  no-VAD sliding window "
                 f"({WIN_S}s/{STRIDE_S}s, jobs={jobs})\n")
-        f.write(f"# windows={len(starts)} silent_skipped={n_silence} "
-                f"blank={n_blank} elapsed={elapsed:.0f}s\n\n")
+        f.write(f"# windows={stats['windows']} "
+                f"silent_skipped={stats['n_silence']} "
+                f"blank={stats['n_blank']} "
+                f"elapsed={stats['elapsed']:.0f}s\n\n")
         for r in records:
-            emo = f" ({r['emotion']})" if r["emotion"] and r["emotion"] != "NEUTRAL" else ""
+            emo = (f" ({r['emotion']})"
+                   if r["emotion"] and r["emotion"] != "NEUTRAL" else "")
             f.write(f"[{r['start']}] {r['text']}{emo}\n")
+
+
+def main():
+    wav_path = sys.argv[1]
+    out_prefix = sys.argv[2]
+    jobs = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    if on_gpu() and jobs > 1:
+        print("GPU mode: forcing jobs=1 (multi-process would contend for one GPU)")
+        jobs = 1
+    print(f"device: {describe()}")
+
+    print("loading audio...")
+    wav16 = load_wav16(wav_path)
+
+    if jobs > 1:
+        total_s = len(wav16) / 16000
+        starts = window_starts(wav16)
+        active, n_silence = energy_gate(wav16, starts)
+        print(f"audio {total_s:.0f}s, windows: {len(starts)}, jobs={jobs}")
+        print(f"energy gate: skipped {n_silence} silent windows")
+        t0 = time.time()
+        raw = parallel_transcribe(wav16, [st for _, st in active], jobs)
+        raw = {active[k][0]: v for k, v in raw.items()}
+        records, n_blank = merge_windows(wav16, active, raw)
+        stats = {"total_s": total_s, "windows": len(starts),
+                 "n_silence": n_silence, "n_blank": n_blank,
+                 "elapsed": time.time() - t0}
+    else:
+        print("loading model...")
+        asr = AutoModel(model="iic/SenseVoiceSmall", disable_update=True,
+                        device=funasr_device())
+        records, stats = transcribe(wav16, asr)
+
+    write_outputs(out_prefix, wav_path, records, stats, jobs)
 
     n_chars = sum(len(r["text"]) for r in records)
     print(f"DONE {wav_path} pieces={len(records)} chars={n_chars} "
-          f"blank={n_blank} elapsed={elapsed:.0f}s "
-          f"(rtf={elapsed / total_s:.3f})")
+          f"blank={stats['n_blank']} elapsed={stats['elapsed']:.0f}s "
+          f"(rtf={stats['elapsed'] / stats['total_s']:.3f})")
 
 
 if __name__ == "__main__":

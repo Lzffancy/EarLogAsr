@@ -75,21 +75,24 @@ SenseVoice 是速度优先（RTF≈0.07）；FireRedASR2-AED 质量优先（句�
 ## 使用
 
 ```bash
-# 1. 三条流
+# 整日批处理（推荐）：一次 import、一次加载，GPU 链与 CPU 链并行
+python run_day.py <wav_dir> <out_dir> --verify voiceprints.json
+
+# 单文件调试：三条流分开跑
 python slidewin_pipeline.py <wav> sw_xxx [--jobs N]
 EARLOG_N_SPK=5 python speaker_timeline.py <wav> spk_xxx
 python scene_timeline.py <wav> sc_xxx
 
-# 2. 融合
+# 融合
 python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.json
 
-# 3. 可选：复核 + 回灌 + 锚定
+# 可选：复核 + 回灌 + 锚定
 python firered_review.py <wav> sw_xxx sw_xxx_review [--ranges=24:00-30:00] [--all]
 python anchor_speakers.py fused_xxx.jsonl
 python fuse.py fused_xxx --text sw_xxx.json --spk spk_xxx.json --scene sc_xxx.json \
     --review sw_xxx_review.json --names speakers_registry.json
 
-# 4. 可选：声纹注册 + 验证模式
+# 可选：声纹注册 + 验证模式
 python enroll_speaker.py 姓名 fused_xxx.jsonl SPKxx
 python speaker_timeline.py --recluster spk_xxx_emb.npy spk_xxx_v --verify voiceprints.json
 ```
@@ -108,12 +111,41 @@ python speaker_timeline.py --recluster spk_xxx_emb.npy spk_xxx_v --verify voicep
 | 场景流 PANNs | 33s | 6s | 5.5× | 标签完全一致 |
 | 说话人流 CAM++ | 78s | 54s | 1.4× | emb 差 1.2e-3，聚类一致 |
 
-单窗 forward 2.0s → 0.23s，端到端 rtf 0.098 → 0.015。8 小时全链 77min → 23min。
+单窗 forward 2.0s → 0.23s，端到端 rtf 0.098 → 0.015。
+
+**但纯推理不是瓶颈，进程初始化才是**（2026-10-23 实测）。单文件固定开销 **49.9s**：
+
+| 项 | 耗时 |
+|---|---|
+| `import torch` + torchaudio | **28.7s** |
+| `import funasr` | **11.7s** |
+| 加载 SenseVoice | 7.4s |
+| 读 259MB wav + resample | 2.1s |
+
+旧流程每个文件起 3 个进程，这笔钱付 3 遍。16 文件的一天 ≈ 36 分钟纯浪费在
+重复 import 上。`run_day.py` 把它压成 1 次，并让 GPU 链（SenseVoice + PANNs）
+与 CPU 链（CAM++）并行跑，实测：
+
+- 3 个 30min 文件、仅 asr：207s → **96.6s（2.14×）**
+- 3 个 30min 文件、全流：约 654s → **276s（2.4×）**
+- 8 小时外推：约 58min → **约 20min**
+
+**已知代价**：同一进程里第 2 个及以后的文件，转写结果与"冷启动单跑同一文件"
+有约 0.7% 的字符差异（48/55 段完全一致）。这是模型冷/热态差异，**稳定而非随机**
+——三次 run_day 运行之间 55/55 完全一致。`torch.use_deterministic_algorithms`
+和 `CUBLAS_WORKSPACE_CONFIG` 都不能消除它。要严格对齐旧产物就用 `run_batch.py`。
 
 - **RMS 能量门**：真静音窗（RMS<1e-3）直接跳过 ASR。与 VAD 不同——只拦"什么声音都没有"，不做语音/噪声判断，零误杀风险。对含大段空白的录音（如夜间）节省线性时间
 - **`--jobs N` 进程池**：窗口级并行。实测本机无增益（单进程 torch 已占满 8 核），保留给多核大机。注意不同线程数改变浮点归约顺序，输出有 ±0.5% 字面漂移
-- **已验证无效的方向**：批量推理只快 6% 且输出漂移明显；CPU 饱和机器上进程并发为负收益
-- **未做的杠杆**：int8 量化（约 2 倍）、重叠减到 5s（省 17%）、GPU 端 fp16（当前全程 fp32，见兼容性一节）
+- **已验证无效的方向**（2026-10-23 全部实测）：
+  - SenseVoice 批量推理只快 6%；CAM++ 批量 bs=8 只快 5.7%、bs≥16 反而更慢（但输出逐位一致）
+    → 瓶颈是 CPU 卷积算力，不是 Python 调用开销
+  - `fp16=True` 直接报错：FunASR `auto_model.py:678` 只转权重不转输入，权重 half 输入 float32
+  - `torch.autocast` 只快 1.07×，代价是逐窗文本一致率掉到 62%、整段相似度 0.9647 → **维持 fp32**
+  - 改 `torch.set_num_threads` 会改变浮点归约顺序，4 线程 vs 8 线程只有 48/55 段一致 → 不要动
+  - CPU 饱和机器上进程并发为负收益
+- **未做的杠杆**：int8 量化（约 2 倍）、重叠减到 5s（省 17%）、
+  把 CAM++ 的 hop 从 2s 放到 4s（spk 算力减半，但 turn 时间分辨率从 2s 降到 4s，需验收）
 
 ## 兼容性
 
@@ -139,6 +171,8 @@ GPU 模式注意：
 
 ## 模块
 
+- `run_day.py`：整日批处理入口。一次 import、一次加载，GPU 链与 CPU 链并行
+- `run_batch.py`：逐文件起子进程的旧批处理入口。慢 2.4×，但产物与"单文件冷启动"逐字一致，留作对照与调试
 - `sensevoice_transcribe.py`：SenseVoice 富标签解析（parse_rich / fmt_ts），也可独立转写
 - `earlog_pipeline.py`：聚类与段合并工具库（cluster / merge_segments）
 - `device_config.py`：设备自动探测，被所有管线脚本 import，勿删

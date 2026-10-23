@@ -161,6 +161,56 @@ def positionals(argv):
     return out
 
 
+# ---------------- reusable core ----------------
+# run_day.py imports these so a day of files shares one interpreter and one
+# loaded CAM++ instance.
+
+
+def load_wav16(wav_path):
+    audio, sr = sf.read(wav_path, dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    return torchaudio.functional.resample(
+        torch.from_numpy(audio).unsqueeze(0), sr, 16000)[0].numpy()
+
+
+def embed(wav16, spk, verbose=True):
+    """CAM++ embedding per hop. Returns X (n_hops, D), L2-normalised."""
+    win, hop = int(WIN_S * 16000), int(HOP_S * 16000)
+    starts = list(range(0, max(1, len(wav16) - win + 1), hop))
+    if verbose:
+        print(f"audio {len(wav16) / 16000:.0f}s, hops: {len(starts)}")
+    embs = []
+    for i, st in enumerate(starts):
+        emb = spk.generate(input=wav16[st: st + win])[0]["spk_embedding"]
+        if hasattr(emb, "detach"):
+            emb = emb.detach().cpu()
+        emb = np.asarray(emb, dtype=np.float32).flatten()
+        embs.append(emb / (np.linalg.norm(emb) + 1e-8))
+        if verbose and (i + 1) % 100 == 0:
+            print(f"  emb {i + 1}/{len(starts)}")
+    return np.stack(embs)
+
+
+def embed_file(wav_path, spk, out_prefix, threshold, vp_path=None, vthr=0.45,
+               n_speakers=None, verbose=True):
+    """Speaker stage for one file: embed -> save npy -> label -> write json."""
+    wav16 = load_wav16(wav_path)
+    total_s = len(wav16) / 16000
+    t0 = time.time()
+    X = embed(wav16, spk, verbose)
+    np.save(out_prefix + "_emb.npy", X)
+    if vp_path:
+        labels = hybrid_labels(X, vp_path, vthr, threshold, n_speakers)
+    else:
+        labels = cluster(X, threshold, n_speakers)
+    elapsed = time.time() - t0
+    if verbose:
+        print(f"  emb done, clustering... ({elapsed:.0f}s)")
+    write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path)
+    return X, labels, elapsed
+
+
 def main():
     vp_path, vthr = parse_verify(sys.argv)
     if sys.argv[1] == "--recluster":
@@ -179,42 +229,10 @@ def main():
         threshold = float(pos[0]) if pos and _is_float(pos[0]) else 0.8
     n_speakers = int(os.environ.get("EARLOG_N_SPK", "0")) or None
 
-    print("loading audio...")
-    audio, sr = sf.read(wav_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    wav16 = torchaudio.functional.resample(
-        torch.from_numpy(audio).unsqueeze(0), sr, 16000)[0].numpy()
-    total_s = len(wav16) / 16000
-
     print(f"loading cam++... (device={speaker_device()})")
     spk = AutoModel(model="cam++", disable_update=True, device=speaker_device())
-
-    win, hop = int(WIN_S * 16000), int(HOP_S * 16000)
-    starts = list(range(0, max(1, len(wav16) - win + 1), hop))
-    print(f"audio {total_s:.0f}s, hops: {len(starts)}")
-
-    t0 = time.time()
-    embs = []
-    for i, st in enumerate(starts):
-        seg = wav16[st: st + win]
-        emb = spk.generate(input=seg)[0]["spk_embedding"]
-        if hasattr(emb, "detach"):          # GPU: funasr returns a cuda tensor
-            emb = emb.detach().cpu()
-        emb = np.asarray(emb, dtype=np.float32).flatten()
-        embs.append(emb / (np.linalg.norm(emb) + 1e-8))
-        if (i + 1) % 100 == 0:
-            print(f"  emb {i + 1}/{len(starts)}")
-    X = np.stack(embs)
-    np.save(out_prefix + "_emb.npy", X)
-
-    if vp_path:
-        labels = hybrid_labels(X, vp_path, vthr, threshold, n_speakers)
-    else:
-        labels = cluster(X, threshold, n_speakers)
-    elapsed = time.time() - t0
-    print(f"  emb done, clustering... ({elapsed:.0f}s)")
-    write_turns(labels, total_s, out_prefix, threshold, elapsed, wav_path)
+    embed_file(wav_path, spk, out_prefix, threshold, vp_path, vthr or 0.45,
+               n_speakers)
 
 
 if __name__ == "__main__":
